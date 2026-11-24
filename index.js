@@ -38,7 +38,7 @@ import * as csvImport from './imports/csvImport.js';
 import * as expiryTracking from './imports/expiryTracking.js';
 
 const app = express();
-const port = 3000;
+const port = 3001;
 const HOST = '0.0.0.0'; // Listens on all local network paths
 const saltRounds = 5;
 env.config();

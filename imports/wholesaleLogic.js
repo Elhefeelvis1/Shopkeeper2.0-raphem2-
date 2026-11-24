@@ -1,0 +1,326 @@
+import logStockTransaction from "./updateStockChanges.js";
+
+/**
+ * Search products with wholesale pricing information
+ */
+export async function searchWholesaleDb(name, category, db) {
+    const queryParts = [];
+    const params = [];
+    let paramCounter = 1;
+
+    if (name) {
+        queryParts.push(`(ast.name ILIKE $${paramCounter} OR ast.barcode ILIKE $${paramCounter})`);
+        params.push(`%${name}%`);
+        paramCounter++;
+    }
+
+    if (category) {
+        queryParts.push(`categories.name ILIKE $${paramCounter}`);
+        params.push(`%${category}%`);
+        paramCounter++;
+    }
+
+    let sqlQuery = `
+        SELECT 
+            ast.id AS item_id,
+            ast.barcode,
+            ast.name AS item_name,
+            ast.unit_selling_price,
+            ast.wholesale_price,
+            ast.wholesale_multiplier,
+            ast.total_quantity_in_stock,
+            ast.last_cost_price,
+            categories.name AS category_name,
+            units.name AS base_unit_name,
+            wu.name AS wholesale_unit_name,
+            wu.id AS wholesale_unit_id
+        FROM all_stocks ast
+        JOIN units ON ast.unit_id = units.id
+        JOIN categories ON ast.category_id = categories.id
+        LEFT JOIN wholesale_units wu ON ast.wholesale_unit_id = wu.id
+    `;
+
+    if (queryParts.length > 0) {
+        sqlQuery += ' WHERE ' + queryParts.join(' AND ');
+    }
+
+    sqlQuery += ' ORDER BY ast.name ASC;';
+
+    try {
+        const result = await db.query(sqlQuery, params);
+        return result.rows;
+    } catch (err) {
+        console.error('Database query error in searchWholesaleDb:', err);
+        throw new Error(`Failed to perform wholesale product search: ${err.message}`);
+    }
+}
+
+/**
+ * Fetch wholesale units dictionary
+ */
+export async function getWholesaleUnits(db) {
+    try {
+        const result = await db.query('SELECT id, name FROM wholesale_units ORDER BY name ASC;');
+        return result.rows;
+    } catch (err) {
+        console.error('Error fetching wholesale units:', err);
+        throw new Error('Failed to fetch wholesale units.');
+    }
+}
+
+let isWholesaleSchemaChecked = false;
+async function ensureClientWholesaleIdColumn(client) {
+    if (isWholesaleSchemaChecked) return;
+    try {
+        await client.query(`
+            ALTER TABLE wholesales ADD COLUMN IF NOT EXISTS client_wholesale_id VARCHAR(100);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_wholesales_client_wholesale_id ON wholesales (client_wholesale_id) WHERE client_wholesale_id IS NOT NULL;
+        `);
+        isWholesaleSchemaChecked = true;
+    } catch (e) {
+        console.warn('Note: client_wholesale_id check in wholesales:', e.message);
+    }
+}
+
+/**
+ * Record a Wholesale transaction (FEFO stock lot deduction with unit multipliers)
+ */
+export async function saveWholesale(userId, wholesaleData, client, res) {
+    const items = wholesaleData?.items;
+    const totalDiscountValue = parseFloat(wholesaleData?.totalDiscount) || 0;
+    const clientWholesaleId = wholesaleData?.clientWholesaleId || wholesaleData?.client_wholesale_id || null;
+
+    // Upfront Validation BEFORE acquiring transaction locks
+    if (!userId || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ success: false, message: 'Invalid wholesale data provided. User ID and items array are required.' });
+    }
+
+    if (totalDiscountValue < 0) {
+        return res.status(400).json({ success: false, message: 'Invalid discount value provided (cannot be negative).' });
+    }
+
+    try {
+        await ensureClientWholesaleIdColumn(client);
+        await client.query('BEGIN');
+
+        // Idempotency Check: Avoid Duplicate Wholesales
+        if (clientWholesaleId) {
+            const existingWholesale = await client.query(
+                `SELECT w.id, w.user_id, w.total_amount, w.discount_applied, w.wholesale_date, u.username 
+                 FROM wholesales w 
+                 LEFT JOIN users u ON w.user_id = u.id 
+                 WHERE w.client_wholesale_id = $1;`,
+                [clientWholesaleId]
+            );
+
+            if (existingWholesale.rows.length > 0) {
+                await client.query('COMMIT');
+                const wholesaleRecord = existingWholesale.rows[0];
+                return {
+                    wholesaleId: wholesaleRecord.id,
+                    username: wholesaleRecord.username || 'Wholesale Rep',
+                    wholesaleData: items,
+                    totalAmount: parseFloat(wholesaleRecord.total_amount).toFixed(2),
+                    discountApplied: parseFloat(wholesaleRecord.discount_applied).toFixed(2),
+                    wholesaleDate: wholesaleRecord.wholesale_date,
+                    isDuplicate: true
+                };
+            }
+        }
+
+        // 1. Create Initial Wholesale Header
+        let totalWholesaleAmount = 0;
+        const rawCustomerId = wholesaleData.customerId;
+        const validCustomerId = (rawCustomerId && !isNaN(parseInt(rawCustomerId, 10)) && (typeof rawCustomerId !== 'string' || !rawCustomerId.startsWith('local_'))) 
+            ? parseInt(rawCustomerId, 10) 
+            : null;
+
+        const wholesaleResult = await client.query(
+            `INSERT INTO wholesales (
+                user_id, 
+                total_amount, 
+                discount_applied, 
+                customer_id, 
+                pay_route, 
+                bank_id,
+                client_wholesale_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, wholesale_date;`,
+            [
+                userId,
+                0.00,
+                0.00,
+                validCustomerId,
+                wholesaleData.payRoute || 'Cash',
+                wholesaleData.bank ? parseInt(wholesaleData.bank, 10) : null,
+                clientWholesaleId
+            ]
+        );
+        const wholesaleId = wholesaleResult.rows[0].id;
+
+        // 2. Process Line Items (FEFO Stock Lot Deductions)
+        for (const item of items) {
+            const productId = item.productId || item.item_id;
+            const quantity = Number(item.quantity); // Number of wholesale units (e.g., 5 packs)
+            const unitMultiplier = Math.max(1, Number(item.unitMultiplier || item.wholesale_multiplier || 1));
+            const wholesalePrice = parseFloat(item.wholesalePrice || item.sellPrice || item.selling_price || 0);
+            const wholesaleUnitName = item.wholesaleUnit || item.wholesale_unit || 'Pack';
+
+            const totalBaseUnitsToSell = quantity * unitMultiplier;
+
+            if (quantity <= 0 || wholesalePrice < 0 || !productId) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    success: false,
+                    message: `Invalid wholesale item data. Product ID: ${productId}, Quantity: ${quantity}, Price: ${wholesalePrice}.`
+                });
+            }
+
+            // Retrieve available lots sorted by expiry date (FEFO)
+            let availableLotsResult = await client.query(
+                `SELECT lot_id, quantity_in_lot, cost_per_unit, expiry_date
+                 FROM stock_lots
+                 WHERE product_id = $1 AND quantity_in_lot > 0
+                 ORDER BY expiry_date ASC NULLS LAST, entry_date ASC;`,
+                [productId]
+            );
+
+            let currentTotalStock = 0;
+            availableLotsResult.rows.forEach(lot => {
+                currentTotalStock += Number(lot.quantity_in_lot);
+            });
+
+            let remainingBaseUnitsToSell = totalBaseUnitsToSell;
+            const soldFromLots = [];
+            const lotUpdates = [];
+
+            for (const lot of availableLotsResult.rows) {
+                if (remainingBaseUnitsToSell <= 0) break;
+
+                const deductFromLot = Math.min(remainingBaseUnitsToSell, Number(lot.quantity_in_lot));
+                if (deductFromLot > 0) {
+                    lotUpdates.push({
+                        lotId: lot.lot_id,
+                        quantity: deductFromLot
+                    });
+                    soldFromLots.push({
+                        lotId: lot.lot_id,
+                        quantity: deductFromLot,
+                        costPerUnit: parseFloat(lot.cost_per_unit) || 0
+                    });
+                    remainingBaseUnitsToSell -= deductFromLot;
+                }
+            }
+
+            if (remainingBaseUnitsToSell > 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    success: false,
+                    message: `Insufficient stock for product. Required: ${totalBaseUnitsToSell} base units (${quantity} ${wholesaleUnitName}s), Available in stock: ${currentTotalStock} base units.`
+                });
+            }
+
+            // Batched stock_lots update
+            const lotIds = lotUpdates.map(u => u.lotId);
+            let caseStatement = `CASE lot_id `;
+            lotUpdates.forEach(u => {
+                caseStatement += `WHEN ${u.lotId} THEN quantity_in_lot - ${u.quantity} `;
+            });
+            caseStatement += `ELSE quantity_in_lot END`;
+
+            if (lotIds.length > 0) {
+                await client.query(
+                    `UPDATE stock_lots
+                     SET quantity_in_lot = ${caseStatement},
+                         is_closed = (CASE WHEN (${caseStatement}) <= 0 THEN TRUE ELSE FALSE END),
+                         last_updated_date = CURRENT_TIMESTAMP
+                     WHERE lot_id = ANY($1::int[]);`,
+                    [lotIds]
+                );
+            }
+
+            // Calculate line totals
+            const lineItemWholesaleTotal = quantity * wholesalePrice;
+            totalWholesaleAmount += lineItemWholesaleTotal;
+
+            let wholesaleUnitId = item.wholesaleUnitId || item.wholesale_unit_id || null;
+            if (!wholesaleUnitId && wholesaleUnitName) {
+                const wuRes = await client.query('SELECT id FROM wholesale_units WHERE name = $1', [wholesaleUnitName]);
+                if (wuRes.rows.length > 0) {
+                    wholesaleUnitId = wuRes.rows[0].id;
+                }
+            }
+
+            // Calculate total cost across drawn lots
+            let totalLineCost = 0;
+            for (const soldLot of soldFromLots) {
+                totalLineCost += soldLot.quantity * soldLot.costPerUnit;
+            }
+
+            // Insert single consolidated line item for this wholesale product
+            await client.query(
+                `INSERT INTO wholesale_line_items 
+                 (wholesale_id, product_id, lot_id, quantity_sold, wholesale_unit_id, unit_multiplier, total_base_units, selling_price_per_unit, cost_at_sale)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`,
+                [
+                    wholesaleId,
+                    productId,
+                    soldFromLots[0]?.lotId || null,
+                    quantity,
+                    wholesaleUnitId,
+                    unitMultiplier,
+                    totalBaseUnitsToSell,
+                    wholesalePrice,
+                    totalLineCost
+                ]
+            );
+
+            // Log stock transaction for wholesale
+            const newQty = currentTotalStock - totalBaseUnitsToSell;
+            await logStockTransaction(client, {
+                productId: productId,
+                changeAmount: -totalBaseUnitsToSell,
+                oldQty: currentTotalStock,
+                newQty: newQty,
+                changeType: 'Wholesale',
+                costImpact: -totalLineCost,
+                userId: userId,
+                wholesaleId: wholesaleId
+            });
+        }
+
+        // 3. Apply Discount & Finalize Wholesale Total
+        let discountToApply = totalDiscountValue;
+        if (discountToApply > totalWholesaleAmount) {
+            discountToApply = totalWholesaleAmount;
+        }
+        const finalNetWholesaleAmount = totalWholesaleAmount - discountToApply;
+
+        const updatedWholesaleResult = await client.query(
+            `UPDATE wholesales 
+             SET total_amount = $1, discount_applied = $2 
+             WHERE id = $3
+             RETURNING id, user_id, total_amount, discount_applied, wholesale_date;`,
+            [finalNetWholesaleAmount, discountToApply, wholesaleId]
+        );
+        const wholesaleRecord = updatedWholesaleResult.rows[0];
+
+        const userResult = await client.query(`SELECT username FROM users WHERE id = $1;`, [wholesaleRecord.user_id]);
+        const username = userResult.rows[0] ? userResult.rows[0].username : 'Unknown User';
+
+        await client.query('COMMIT');
+
+        return {
+            wholesaleId: wholesaleRecord.id,
+            username: username,
+            wholesaleData: items,
+            totalAmount: parseFloat(wholesaleRecord.total_amount).toFixed(2),
+            discountApplied: parseFloat(wholesaleRecord.discount_applied).toFixed(2),
+            wholesaleDate: wholesaleRecord.wholesale_date
+        };
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error processing wholesale:', error);
+        throw new Error(`Failed to process wholesale: ${error.message || 'Unknown error'}`);
+    }
+}

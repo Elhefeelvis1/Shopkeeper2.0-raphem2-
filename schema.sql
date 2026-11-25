@@ -133,7 +133,7 @@ CREATE TABLE public.all_stocks (
     last_updated_date timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     user_id integer NOT NULL,
     unit_id integer NOT NULL,
-    category_id integer DEFAULT 0,
+    category_id integer,
     company_id integer,
     last_cost_price numeric(10,2),
     barcode character varying(50),
@@ -1264,7 +1264,7 @@ ALTER TABLE ONLY public.all_stocks
 --
 
 ALTER TABLE ONLY public.all_stocks
-    ADD CONSTRAINT fk_category_product_def FOREIGN KEY (category_id) REFERENCES public.categories(id) ON UPDATE CASCADE ON DELETE SET DEFAULT;
+    ADD CONSTRAINT fk_category_product_def FOREIGN KEY (category_id) REFERENCES public.categories(id) ON UPDATE CASCADE ON DELETE SET NULL;
 
 
 --

@@ -186,20 +186,41 @@ export const importStocksCsv = async (req, res, db) => {
                     unitId = newUnit.rows[0].id;
                 }
 
-                // Resolve Category ID
+                // Resolve Category ID (Optional)
                 let categoryId = null;
                 const catCol = mappings['category'];
-                if (catCol && row[catCol]) {
-                    const catName = row[catCol];
-                    const catRes = await client.query('SELECT id FROM categories WHERE name = $1', [catName]);
-                    if (catRes.rows.length > 0) {
-                        categoryId = catRes.rows[0].id;
-                    } else {
-                        const newCat = await client.query('INSERT INTO categories (name) VALUES ($1) RETURNING id', [catName]);
-                        categoryId = newCat.rows[0].id;
+                if (catCol && row[catCol] !== undefined && row[catCol] !== null && String(row[catCol]).trim() !== '') {
+                    const catVal = String(row[catCol]).trim();
+                    const catNum = parseInt(catVal, 10);
+                    if (!isNaN(catNum)) {
+                        const catRes = await client.query('SELECT id FROM categories WHERE id = $1', [catNum]);
+                        if (catRes.rows.length > 0) categoryId = catRes.rows[0].id;
                     }
-                } else {
-                    categoryId = 0; // Uncategorized default
+                    if (!categoryId) {
+                        const catRes = await client.query('SELECT id FROM categories WHERE LOWER(name) = LOWER($1)', [catVal]);
+                        if (catRes.rows.length > 0) {
+                            categoryId = catRes.rows[0].id;
+                        } else if (isNaN(catNum)) {
+                            const newCat = await client.query('INSERT INTO categories (name) VALUES ($1) RETURNING id', [catVal]);
+                            categoryId = newCat.rows[0].id;
+                        }
+                    }
+                }
+
+                // If no category was resolved, use an existing fallback category to prevent foreign key violation
+                if (!categoryId) {
+                    const fallbackCat = await client.query("SELECT id FROM categories WHERE id = 0 OR LOWER(name) = 'uncategorized' ORDER BY id ASC LIMIT 1");
+                    if (fallbackCat.rows.length > 0) {
+                        categoryId = fallbackCat.rows[0].id;
+                    } else {
+                        const anyCat = await client.query("SELECT id FROM categories ORDER BY id ASC LIMIT 1");
+                        if (anyCat.rows.length > 0) {
+                            categoryId = anyCat.rows[0].id;
+                        } else {
+                            const newCat = await client.query("INSERT INTO categories (name) VALUES ('Uncategorized') RETURNING id");
+                            categoryId = newCat.rows[0].id;
+                        }
+                    }
                 }
 
                 // Resolve Supplier ID (Optional)

@@ -93,25 +93,47 @@ export const importStocksCsv = async (req, res, db) => {
 
         for (let i = 0; i < data.length; i++) {
             const row = data[i];
+            const itemName = mappings['name'] ? (row[mappings['name']] || `Row ${i + 1}`) : `Row ${i + 1}`;
+
+            // Skip entirely blank rows (e.g. trailing empty CSV lines)
+            const rowValues = Object.values(row).map(v => String(v ?? '').trim()).filter(v => v !== '');
+            if (rowValues.length === 0) continue;
+
             for (const reqField of requiredCoreFields) {
                 const mappedCsvHeader = mappings[reqField];
                 const val = row[mappedCsvHeader];
                 if (val === undefined || val === null || String(val).trim() === '') {
-                    return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} has an empty required value for '${reqField}'.` });
+                    return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} ("${itemName}") has an empty required value for '${reqField}'.` });
                 }
             }
 
             const priceCol = mappings['unit_selling_price'];
-            const priceVal = parseFloat(String(row[priceCol]).replace(/,/g, ''));
+            const rawPrice = String(row[priceCol] ?? '').trim();
+            let cleanPrice = rawPrice.replace(/[₦$€£]|NGN/gi, '').replace(/,/g, '').trim();
+            if (cleanPrice === '-' || cleanPrice === '--' || cleanPrice === 'N/A' || cleanPrice === 'nil') {
+                cleanPrice = '0';
+            }
+            const priceVal = parseFloat(cleanPrice);
             if (isNaN(priceVal) || priceVal < 0) {
-                 return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} has an invalid selling price.` });
+                 return res.status(400).json({ 
+                     success: false, 
+                     message: `Validation Failed: Row ${i + 1} ("${itemName}") has an invalid selling price: "${rawPrice}".` 
+                 });
             }
 
             const costCol = mappings['cost_per_unit'];
             if (costCol && row[costCol] !== undefined && row[costCol] !== "") {
-                 const costVal = parseFloat(String(row[costCol]).replace(/,/g, ''));
+                 const rawCost = String(row[costCol]).trim();
+                 let cleanCost = rawCost.replace(/[₦$€£]|NGN/gi, '').replace(/,/g, '').trim();
+                 if (cleanCost === '-' || cleanCost === '--' || cleanCost === 'N/A' || cleanCost === 'nil') {
+                     cleanCost = '0';
+                 }
+                 const costVal = parseFloat(cleanCost);
                  if (isNaN(costVal) || costVal < 0) {
-                     return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} has an invalid cost per unit.` });
+                     return res.status(400).json({ 
+                         success: false, 
+                         message: `Validation Failed: Row ${i + 1} ("${itemName}") has an invalid cost per unit: "${rawCost}".` 
+                     });
                  }
             }
 
@@ -119,13 +141,13 @@ export const importStocksCsv = async (req, res, db) => {
             if (expiryCol && row[expiryCol] && String(row[expiryCol]).trim() !== '') {
                 const dateObj = new Date(row[expiryCol]);
                 if (isNaN(dateObj.getTime())) {
-                    return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} has an unparseable expiry date '${row[expiryCol]}'. Format must be YYYY-MM-DD.` });
+                    return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} ("${itemName}") has an unparseable expiry date '${row[expiryCol]}'. Format must be YYYY-MM-DD.` });
                 }
             }
 
             const reorderCol = mappings['reorder_level'];
             if (!reorderCol || row[reorderCol] === undefined || row[reorderCol] === "") {
-                 return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} is missing the required reorder_level field.` });
+                 return res.status(400).json({ success: false, message: `Validation Failed: Row ${i + 1} ("${itemName}") is missing the required reorder_level field.` });
             }
         }
 
@@ -148,6 +170,10 @@ export const importStocksCsv = async (req, res, db) => {
             let insertedCount = 0;
             
             for (const row of data) {
+                // Skip entirely blank rows
+                const rowValues = Object.values(row).map(v => String(v ?? '').trim()).filter(v => v !== '');
+                if (rowValues.length === 0) continue;
+
                 // Resolve Unit ID
                 let unitId = null;
                 const unitCol = mappings['unit'];
@@ -190,11 +216,33 @@ export const importStocksCsv = async (req, res, db) => {
                     }
                 }
 
+                // Resolve Company ID (Optional)
+                let companyId = null;
+                const compCol = mappings['company'];
+                if (compCol && row[compCol] !== undefined && row[compCol] !== null && String(row[compCol]).trim() !== '') {
+                    const compVal = String(row[compCol]).trim();
+                    const compNum = parseInt(compVal, 10);
+                    if (!isNaN(compNum)) {
+                        const compRes = await client.query('SELECT id FROM companies WHERE id = $1', [compNum]);
+                        if (compRes.rows.length > 0) companyId = compRes.rows[0].id;
+                    }
+                    if (!companyId) {
+                        const compRes = await client.query('SELECT id FROM companies WHERE name = $1', [compVal]);
+                        if (compRes.rows.length > 0) {
+                            companyId = compRes.rows[0].id;
+                        } else if (isNaN(compNum)) {
+                            const newComp = await client.query('INSERT INTO companies (name) VALUES ($1) RETURNING id', [compVal]);
+                            companyId = newComp.rows[0].id;
+                        }
+                    }
+                }
+
                 // Build insert parameters for all_stocks
-                const cols = ['user_id', 'unit_id', 'category_id'];
-                const vals = ['$1', '$2', '$3'];
-                const params = [userId, unitId, categoryId];
-                let pCounter = 4;
+                // Explicitly include company_id as NULL or resolved ID to prevent PostgreSQL falling back to DEFAULT 0
+                const cols = ['user_id', 'unit_id', 'category_id', 'company_id'];
+                const vals = ['$1', '$2', '$3', '$4'];
+                const params = [userId, unitId, categoryId, companyId];
+                let pCounter = 5;
 
                 if (supplierId) {
                     cols.push('supplier_id');
@@ -212,7 +260,8 @@ export const importStocksCsv = async (req, res, db) => {
                             let val = row[csvCol];
                             const dType = allStockTypes[field];
                             if (dType && ['numeric', 'integer', 'real', 'double precision', 'decimal', 'money'].includes(dType) && typeof val === 'string') {
-                                val = val.replace(/,/g, '');
+                                val = val.replace(/[₦$€£]|NGN/gi, '').replace(/,/g, '').trim();
+                                if (val === '-' || val === '--' || val === 'N/A' || val === 'nil') val = '0';
                             }
                             cols.push(field);
                             vals.push(`$${pCounter}`);
@@ -238,7 +287,8 @@ export const importStocksCsv = async (req, res, db) => {
                     const costCol = mappings['cost_per_unit'];
                     let costVal = row[costCol];
                     if (typeof costVal === 'string') {
-                        costVal = costVal.replace(/,/g, '');
+                        costVal = costVal.replace(/[₦$€£]|NGN/gi, '').replace(/,/g, '').trim();
+                        if (costVal === '-' || costVal === '--' || costVal === 'N/A' || costVal === 'nil') costVal = '0';
                     }
                     const expiryCol = mappings['expiry_date'];
                     

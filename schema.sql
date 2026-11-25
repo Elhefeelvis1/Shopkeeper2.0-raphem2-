@@ -134,7 +134,7 @@ CREATE TABLE public.all_stocks (
     user_id integer NOT NULL,
     unit_id integer NOT NULL,
     category_id integer DEFAULT 0,
-    company_id integer DEFAULT 0,
+    company_id integer,
     last_cost_price numeric(10,2),
     barcode character varying(50),
     wholesale_price numeric(10,2) DEFAULT 0.00,
@@ -1272,7 +1272,7 @@ ALTER TABLE ONLY public.all_stocks
 --
 
 ALTER TABLE ONLY public.all_stocks
-    ADD CONSTRAINT fk_company_product_def FOREIGN KEY (company_id) REFERENCES public.companies(id) ON UPDATE CASCADE ON DELETE SET DEFAULT;
+    ADD CONSTRAINT fk_company_product_def FOREIGN KEY (company_id) REFERENCES public.companies(id) ON UPDATE CASCADE ON DELETE SET NULL;
 
 
 --

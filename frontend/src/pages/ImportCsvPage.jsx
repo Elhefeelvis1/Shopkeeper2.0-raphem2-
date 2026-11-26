@@ -14,6 +14,22 @@ const allowedTables = [
   { id: 'companies', name: 'Companies' }
 ];
 
+const COLUMN_LABELS = {
+  name: 'Item Name',
+  unit: 'Unit of Measure',
+  unit_selling_price: 'Selling Price',
+  wholesale_price: 'Wholesale Price',
+  quantity: 'Opening Stock Quantity',
+  cost_per_unit: 'Cost Price (Per Unit)',
+  expiry_date: 'Expiry Date',
+  reorder_level: 'Reorder Level',
+  barcode: 'Barcode',
+  generic_name: 'Generic Name',
+  category: 'Category',
+  company: 'Company / Brand',
+  wholesale_unit: 'Wholesale Unit'
+};
+
 const ImportCsvPage = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -88,15 +104,26 @@ const ImportCsvPage = () => {
     try {
       const res = await axios.get(`/api/schema/${selectedTable}`);
       if (res.data.success) {
-        const fetchedSchema = res.data.schema;
+        // Exclude last_cost_price from CSV import mapping (cost_per_unit is used for stock lots)
+        let fetchedSchema = res.data.schema;
+        if (selectedTable === 'all_stocks') {
+          fetchedSchema = fetchedSchema.filter(col => col.column_name !== 'last_cost_price');
+        }
         setSchema(fetchedSchema);
         
-        // Auto-match logic
+        // Auto-match logic with aliases
         const initialMappings = {};
         fetchedSchema.forEach(col => {
-          const matchedHeader = csvHeaders.find(
-            header => header.toLowerCase().replace(/[^a-z0-9]/g, '') === col.column_name.toLowerCase().replace(/[^a-z0-9]/g, '')
-          );
+          const colClean = col.column_name.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const matchedHeader = csvHeaders.find(header => {
+            const hClean = header.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (hClean === colClean) return true;
+            // Aliases for cost_per_unit
+            if (col.column_name === 'cost_per_unit' && ['cost', 'costprice', 'costperunit', 'unitcost', 'buyingprice', 'purchaseprice'].includes(hClean)) return true;
+            // Aliases for unit_selling_price
+            if (col.column_name === 'unit_selling_price' && ['sellingprice', 'sellprice', 'price', 'unitsellingprice'].some(alias => hClean.includes(alias))) return true;
+            return false;
+          });
           if (matchedHeader) {
             initialMappings[col.column_name] = matchedHeader;
           } else {
@@ -325,7 +352,12 @@ const ImportCsvPage = () => {
                       <tr key={col.column_name} className="bg-white">
                         <td className="px-6 py-4">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium text-gray-900">{col.column_name}</span>
+                            <span className="font-medium text-gray-900">
+                              {COLUMN_LABELS[col.column_name] || col.column_name}
+                            </span>
+                            {COLUMN_LABELS[col.column_name] && (
+                              <span className="text-xs text-gray-400 font-mono">({col.column_name})</span>
+                            )}
                             {isRequired ? (
                               <span className="text-[10px] uppercase tracking-wider font-bold bg-red-100 text-red-700 px-2 py-0.5 rounded">Required</span>
                             ) : (

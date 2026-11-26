@@ -1441,7 +1441,7 @@ app.post("/api/searchSales", isAuthenticated, async (req, res) => {
         }
 
         const whereClause = queryParts.length > 0 ? `WHERE ${queryParts.join(' AND ')}` : '';
-        const limitClause = !canViewAll ? 'LIMIT 15' : '';
+        const limitClause = !canViewAll ? 'LIMIT 5' : '';
 
         const salesQuery = `
             SELECT 
@@ -2083,7 +2083,7 @@ app.get('/api/schema/:tableName', isAuthenticated, async (req, res) => {
         if (tableName === 'all_stocks') {
             // Remove raw ID columns so they are not mapped directly (replaced with string equivalents)
             columns = columns.filter(col =>
-                !['unit_id', 'wholesale_unit_id', 'category_id', 'company_id', 'total_quantity_in_stock'].includes(col.column_name)
+                !['unit_id', 'wholesale_unit_id', 'category_id', 'company_id', 'total_quantity_in_stock', 'last_cost_price'].includes(col.column_name)
             );
 
             // Add virtual string columns for foreign keys
